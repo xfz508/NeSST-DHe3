@@ -18,6 +18,7 @@ MT_TOTXSECTION = 1
 MT_ELXSECTION = 2
 MT_N2NXSECTION = 16
 MT_INELXSECTION_START = 51
+MT_NPXSECTION = 103
 
 
 @dataclass
@@ -26,6 +27,8 @@ class ENDFManifest:
     elastic: bool
     inelastic: bool
     n2n: bool
+    np: bool = False
+
 
 
 def retrieve_ENDF_data(json_file):
@@ -40,10 +43,11 @@ def convert_json_to_manifest(json_file):
     manifest_dict = {}
     for filename, file_manifest in json_dict.items():
         manifest_dict[filename] = ENDFManifest(
-            total=file_manifest["total"],
-            elastic=file_manifest["elastic"],
-            inelastic=file_manifest["inelastic"],
-            n2n=file_manifest["n2n"],
+            total=file_manifest.get("total", False),
+            elastic=file_manifest.get("elastic", False),
+            inelastic=file_manifest.get("inelastic", False),
+            n2n=file_manifest.get("n2n", False),
+            np=file_manifest.get("np", False),
         )
     return manifest_dict
 
@@ -116,6 +120,113 @@ def retrieve_ENDF_data_from_manifest(manifest):
 
             else:
                 print(f"{filename}: Warning, LTT ({LTT}) for elastic scattering not recognised...")
+
+            # Initialize the interaction manifest check if not already present
+            if "np" not in return_dict["interactions"].__dict__:
+                return_dict["interactions"].np = False
+
+            # Check for (n,p) reaction flag (defaults to False if missing)
+            if getattr(file_manifest, "np", False):
+                if return_dict["interactions"].np:
+                    print(f"{filename}: Warning, loading (n,p) cross section data from multiple files...")
+                else:
+                    return_dict["interactions"].np = True
+
+                # 1. Load Cross-Section and Q-value from MF=3, MT=103
+                np_table = mat.section_data[MF_XSECTION, MT_NPXSECTION]["sigma"]
+                np_E, np_sigma = np_table.x, np_table.y
+                return_dict["np_xsec"] = {"E": np_E, "sig": np_sigma}
+
+                # Pull QI (Reaction Q-value) or default to Q
+                np_sec3 = mat.section_data[MF_XSECTION, MT_NPXSECTION]
+                np_Q = np_sec3.get("QI", np_sec3.get("QM", 0.0))
+
+                # 2. Parse Angular / Energy Distributions from MF=6, MT=103
+                if (MF_PRODENERGYANGLEDISTS, MT_NPXSECTION) in mat.section_data:
+                    mf6_data = mat.section_data[MF_PRODENERGYANGLEDISTS, MT_NPXSECTION]
+                    products = mf6_data.get("products", [])
+                    # Target the relevant outgoing recoil product (e.g., Triton ZAP=1003 or Proton ZAP=1001)
+                    target_product = None
+                    for prod in products:
+                        # Prefer Triton (1003) for downscatter calculations; fallback to Proton (1001)
+                        if prod.get("ZAP") in [1003, 1001]:
+                            target_product = prod
+                            if prod.get("ZAP") == 1003:  # Priority on heavy recoil
+                                break
+                    if target_product is not None:
+                        law = target_product.get("LAW")
+                        if law == 2:  # Discrete 2-Body Recoil (Legendre in CM)
+                            dist = target_product["distribution"]
+                            np_E_dist = dist["E"]
+                            np_al = convert_to_NeSST_legendre_format(dist["a_l"])
+
+                            return_dict["np_dxsec"] = {
+                                "legendre": True,
+                                "E": np_E_dist,
+                                "a_l": np_al,
+                                "N_l": np_al.shape[1],
+                                "Q": np_Q,
+                                "ZAP": target_product.get("ZAP"),
+                                "A_p": target_product.get("AWP"),
+                            }
+
+                        elif law == 1:  # Continuum / Tabulated double differential
+                            target_E = return_dict.get("elastic_xsec", {}).get("E")
+                            if target_E is None and "total_xsec" in return_dict:
+                                target_E = return_dict["total_xsec"].get("E")
+                            DDX = convert_to_NeSST_LAW1_format(
+                                target_product["distribution"],
+                                target_Ein=target_E
+                            )
+                            return_dict["np_dxsec"] = {
+                                "legendre": False,
+                                "LAW": 1,
+                                "DDX": DDX,
+                                "Q": np_Q,
+                                "ZAP": target_product.get("ZAP"),
+                            }
+                        elif law == 7:  # Laboratory Angle-Energy Tabulated (mu -> E')
+                            DDX = convert_to_NeSST_LAW7_format(target_product["distribution"])
+                            return_dict["np_dxsec"] = {
+                                "legendre": False,
+                                "LAW": 7,
+                                "DDX": DDX,
+                                "Q": np_Q,
+                                "ZAP": target_product.get("ZAP"),
+                            }
+                        else:
+                            print(f"{filename}: LAW = {law} for (n,p) reaction not directly supported...")
+
+                # Fallback to MF=4 if angular data is stored there instead of MF=6
+                elif (4, MT_NPXSECTION) in mat.section_data:
+                    LTT = mat.section_data[4, MT_NPXSECTION]["LTT"]
+                    if LTT == 0:  # Isotropic
+                        return_dict["np_dxsec"] = {
+                            "legendre": True,
+                            "E": np.array([np_E[0], np_E[-1]]),
+                            "a_l": np.zeros((2, 1)),
+                            "N_l": 1,
+                            "Q": np_Q,
+                        }
+                    elif LTT in [1, 3]:  # Legendre
+                        np_leg_table = mat.section_data[4, MT_NPXSECTION]["legendre"]
+                        np_E_dist, np_al = np_leg_table["E"], convert_to_NeSST_legendre_format(np_leg_table["a_l"])
+                        return_dict["np_dxsec"] = {
+                            "legendre": True,
+                            "E": np_E_dist,
+                            "a_l": np_al,
+                            "N_l": np_al.shape[1],
+                            "Q": np_Q,
+                        }
+                else:
+                    # Default to Isotropic in CM if no angular distribution data section exists
+                    return_dict["np_dxsec"] = {
+                        "legendre": True,
+                        "E": np.array([np_E[0], np_E[-1]]),
+                        "a_l": np.zeros((2, 1)),
+                        "N_l": 1,
+                        "Q": np_Q,
+                    }
 
         if file_manifest.inelastic:
             if return_dict["interactions"].inelastic:
@@ -232,6 +343,65 @@ def convert_to_NeSST_legendre_format(ENDF_al):
     uniform_len_al = [np.pad(a, (0, max_Nl - len(a))) for a in ENDF_al]
     return np.array(uniform_len_al)
 
+
+def convert_to_NeSST_LAW1_format(ENDF_dist, target_Ein=None):
+    if isinstance(ENDF_dist, dict):
+        dist_list = ENDF_dist.get("distribution", [])
+        NE = ENDF_dist.get("NE", len(dist_list))
+        E_grid = ENDF_dist.get("energy") or ENDF_dist.get("Ein") or ENDF_dist.get("E")
+    else:
+        dist_list = ENDF_dist
+        NE = len(dist_list)
+        E_grid = None
+    raw_Ein = []
+    for iE in range(NE):
+        if E_grid is not None and iE < len(E_grid):
+            val = E_grid[iE]
+        else:
+            val = dist_list[iE].get("E", 0.0) if iE < len(dist_list) else 0.0
+        if val is not None:
+            raw_Ein.append(float(val))
+    raw_Ein = np.asarray(raw_Ein, dtype=np.float64)
+    """
+    if target_Ein is not None:
+        Ein_final = np.asarray(target_Ein, dtype=np.float64)
+    else:
+        Ein_final = raw_Ein
+    """
+    Ein_final = raw_Ein
+    NE_final = len(Ein_final)
+    default_cos = np.array([-1.0, 1.0], dtype=np.float64)
+    n_cos = len(default_cos)
+    Ein = Ein_final.tolist()
+    Ncos = [n_cos] * NE_final
+    cos = [default_cos] * NE_final
+    NEout = {}
+    Eout = {}
+    f = {}
+    Emax = {}
+    for iE in range(NE_final):
+        raw_idx = int(np.argmin(np.abs(raw_Ein - Ein_final[iE]))) if len(raw_Ein) > 0 else 0
+        dist_Ein = dist_list[raw_idx]
+        e_out_raw = dist_Ein.get("E'") or dist_Ein.get("Eprime") or [0.0]
+        e_out_arr = np.atleast_1d(np.asarray(e_out_raw, dtype=np.float64))
+        if "b" in dist_Ein and len(dist_Ein["b"]) > 0:
+            f_val = np.atleast_1d(np.asarray(dist_Ein["b"], dtype=np.float64))
+        else:
+            f_val = np.ones_like(e_out_arr, dtype=np.float64) / max(len(e_out_arr), 1)
+        if len(f_val) != len(e_out_arr):
+            f_val = np.resize(f_val, e_out_arr.shape)
+        for iM in range(n_cos):
+            key = (iE, iM)
+            NEout[key] = int(len(e_out_arr))
+            Eout[key] = e_out_arr
+            f[key] = f_val
+            Emax[key] = float(np.amax(e_out_arr)) if len(e_out_arr) > 0 else 0.0
+
+    if any(e is None for e in Ein):
+        print("WARNING: Missing incident energy values in LAW=1 conversion!")
+    DDX = NeSST_DDX(NEin=NE_final, Ein=Ein_final, Ncos=Ncos, cos=cos, NEout=NEout, Eout=Eout, f=f, Emax=Emax)
+
+    return DDX
 
 def convert_to_NeSST_LAW7_format(ENDF_dist):
     NE = ENDF_dist["NE"]

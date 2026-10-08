@@ -16,6 +16,7 @@ from NeSST.utils import *
 A_H = Mp / Mn
 A_D = Md / Mn
 A_T = Mt / Mn
+A_He3 = MHe3 / Mn
 A_C = MC / Mn
 A_Be = MBe / Mn
 
@@ -74,6 +75,17 @@ class material_data:
             elif ENDF_data["n2n_dxsec"]["LAW"] == 7:
                 self.n2n_ddx = xs.doubledifferentialcrosssection_data(ENDF_data["n2n_xsec"], ENDF_data["n2n_dxsec"])
 
+        # (n,p) reaction cross section
+        self.l_np = getattr(ENDF_data["interactions"], "np", False)
+        if self.l_np:
+                    self.sigma_np = interpolate_1d(
+                ENDF_data["np_xsec"]["E"],
+                ENDF_data["np_xsec"]["sig"],
+                method="linear",
+                bounds_error=False,
+                fill_value=0.0,
+            )
+
         self.l_inelastic = ENDF_data["interactions"].inelastic
         if ENDF_data["interactions"].inelastic:
             self.n_inelastic = ENDF_data["n_inelastic"]
@@ -127,6 +139,7 @@ class material_data:
         self.Ein = Ein
 
     def init_station_scatter_matrices(self, Nm=100):
+        self.init_total_ddxs(Nm)
         self.init_station_elastic_scatter()
         if self.l_n2n:
             self.init_n2n_ddxs(Nm)
@@ -180,16 +193,22 @@ class material_data:
 
             self.inelastic_dNdEdmu.append(inelastic_dNdEdmu)
 
+    def init_total_ddxs(self, Nm=100):
+        self.tot_mu = np.linspace(-1.0, 1.0, Nm)
+
     def init_n2n_ddxs(self, Nm=100):
         self.n2n_mu = np.linspace(-1.0, 1.0, Nm)
         self.n2n_ddx.regular_grid(self.Ein, self.n2n_mu, self.Eout)
 
     def calc_dNdEs(self, I_E, rhoL_func):
+        self.calc_total_dNdE(I_E, rhoL_func)
         self.calc_station_elastic_dNdE(I_E, rhoL_func)
         if self.l_n2n:
             self.calc_n2n_dNdE(I_E, rhoL_func)
         if self.l_inelastic:
             self.calc_station_inelastic_dNdE(I_E, rhoL_func)
+        if self.l_np:
+            self.calc_np_dNdE(I_E, rhoL_func)
 
     # Spectrum produced by scattering of incoming isotropic neutron source I_E with normalised areal density asymmetry rhoR_asym_func
     def calc_station_elastic_dNdE(self, I_E, rhoL_func):
@@ -203,6 +222,34 @@ class material_data:
             self.inelastic_dNdE += np.trapezoid(
                 self.inelastic_dNdEdmu[i_inelastic] * rhoL_asym * I_E[None, :], self.Ein, axis=1
             )
+
+    def calc_np_dNdE(self, I_E, rhoL_func):
+        """Calculates (n,p) absorption loss spectrum for incident flux I_E."""
+        np_mu = np.linspace(-1.0, 1.0, 100)
+        rhoL_avg = np.trapezoid(rhoL_func(np_mu), np_mu) / 2.0
+        rate_Ein = self.sigma_np(self.Ein) * I_E * rhoL_avg
+        if np.array_equal(self.Ein, self.Eout):
+            self.np_dNdE = rate_Ein
+        else:
+            self.np_dNdE = interpolate_1d(self.Ein, rate_Ein, method="linear", bounds_error=False, fill_value=0.0)(
+                self.Eout)
+
+    def calc_total_dNdE(self, I_E, rhoL_func):
+        """Calculates total interaction spectrum for incident flux I_E."""
+        if not hasattr(self, "tot_mu"):
+            self.init_total_ddxs()
+        rhoL_avg = np.trapezoid(rhoL_func(self.tot_mu), self.tot_mu) / 2.0
+        Ein_arr = np.atleast_1d(np.asarray(self.Ein, dtype=np.float64))
+        if Ein_arr.size <= 1:
+            raise ValueError(
+                f"self.Ein must contain multiple energy points for 1D interpolation. Got shape {Ein_arr.shape}."
+            )
+        rate_Ein = self.sigma_tot(Ein_arr) * I_E * rhoL_avg
+        if np.array_equal(Ein_arr, self.Eout):
+            self.total_dNdE = rate_Ein
+        else:
+            self.total_dNdE = interpolate_1d(Ein_arr, rate_Ein, method="linear", bounds_error=False, fill_value=0.0)(
+                self.Eout)
 
     def calc_n2n_dNdE(self, I_E, rhoL_func):
         rhoL_asym = rhoL_func(self.n2n_mu)

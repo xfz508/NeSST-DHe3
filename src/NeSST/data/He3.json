@@ -1,0 +1,10 @@
+{
+    "2-He-003.C31"  :
+    {
+        "total" : true,
+        "elastic" : true,
+        "inelastic" : false,
+        "np" : true,
+        "n2n" : false
+    }
+}

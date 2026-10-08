@@ -32,6 +32,6 @@ data_dir = os.path.join(package_directory, "./data/")
 ENDF_dir = os.path.join(data_dir, "./ENDF/")
 
 # Materials
-default_mat_list = ["H", "D", "T", "C12", "Be9"]
+default_mat_list = ["H", "D", "T", "He3", "C12", "Be9"]
 available_materials = []
 mat_dict = {}

@@ -22,6 +22,7 @@ col.classical_collisions = False
 # Atomic fraction of D and T in scattering medium and source
 frac_D_default = 0.5
 frac_T_default = 0.5
+frac_He3_default = 0.5
 
 # Units are SI
 # Energies, temperatures eV
@@ -51,6 +52,7 @@ def initialise_material_data(label):
     mat_data = sm.material_data(label, json)
     mat_dict[label] = mat_data
     available_materials.append(label)
+    return mat_data
 
 
 for mat in default_mat_list:
@@ -363,6 +365,65 @@ def calc_DT_ionkin_primspec_rhoL_integral(I_E: npt.NDArray, rhoL_func=None, nT: 
             mat_dict["D"].matrix_primspec_int(I_E)
 
 
+#######################################
+# DHe3 scattered spectra initialisation #
+#######################################
+
+
+def init_DHe3_scatter(Eout: npt.NDArray, Ein: npt.NDArray):
+    """Initialise the scattering matrices for D and He3 materials
+
+    Args:
+        Ein (numpy.array): the array on incoming neutron energies
+        Eout (numpy.array): the array on outgoing neutron energies
+
+    """
+    mat_dict["D"].init_energy_grids(Eout, Ein)
+    mat_dict["He3"].init_energy_grids(Eout, Ein)
+    mat_dict["D"].init_station_scatter_matrices()
+    mat_dict["He3"].init_station_scatter_matrices()
+
+
+def init_DHe3_ionkin_scatter(varr: npt.NDArray, nHe3: bool = False, nD: bool = False):
+    """Initialise the scattering matrices including the effect of ion
+    velocities in the kinematics
+
+    N.B. the static ion scattering matrices must already be calculated
+    e.g. by calling init_DHe3_scatter
+
+    Args:
+        Ein (numpy.array): the array on incoming neutron energies
+        Eout (numpy.array): the array on outgoing neutron energies
+
+    """
+    if nHe3:
+        if mat_dict["He3"].Ein is None:
+            print("nHe3 - Needed to initialise energy grids - see init_DHe3_scatter")
+        else:
+            mat_dict["He3"].full_scattering_matrix_create(varr)
+    if nD:
+        if mat_dict["D"].Ein is None:
+            print("nD - Needed to initialise energy grids - see init_DHe3_scatter")
+        else:
+            mat_dict["D"].full_scattering_matrix_create(varr)
+
+
+def calc_DHe3_ionkin_primspec_rhoL_integral(I_E: npt.NDArray, rhoL_func=None, nHe3: bool = False, nD: bool = False):
+    if nT:
+        if mat_dict["He3"].vvec is None:
+            print("nHe3 - Needed to initialise velocity grid - see init_DHe3_ionkin_scatter")
+        else:
+            if rhoL_func is not None:
+                mat_dict["He3"].scattering_matrix_apply_rhoLfunc(rhoL_func)
+            mat_dict["He3"].matrix_primspec_int(I_E)
+    if nD:
+        if mat_dict["D"].vvec is None:
+            print("nD - Needed to initialise velocity grid - see init_DHe3_ionkin_scatter")
+        else:
+            if rhoL_func is not None:
+                mat_dict["D"].scattering_matrix_apply_rhoLfunc(rhoL_func)
+            mat_dict["D"].matrix_primspec_int(I_E)
+
 ###################################
 # General material initialisation #
 ###################################
@@ -536,6 +597,149 @@ def DT_transmission(
     return np.exp(-A_1S * rhoL_func(1.0) * tot_xsec)
 
 
+def DHe3_sym_scatter_spec(
+    I_E: npt.NDArray, frac_D: float = frac_D_default, frac_He3: float = frac_He3_default
+) -> typing.Tuple[npt.NDArray, typing.Tuple[npt.NDArray, npt.NDArray, npt.NDArray, npt.NDArray]]:
+    """Calculates the single scattered neutron spectrum for DHe3 given a
+    primary neutron spectrum of I_E from isotropic areal density
+
+    This requires the scattering matrices to have been pre-calculated
+
+    The primary neutron spectrum, I_E, is assumed to be on the same energy grid as
+    the incoming energy grid used to calculate the scattering matrices
+
+    Args:
+        I_E (numpy.array): the neutron spectrum at Ein energies
+
+    Returns:
+        Tuple of numpy.arrays: the total scattered spectrum and a tuple of the components
+        (nD,nHe3,Dn2n,He3np)
+
+    """
+    rhoL_func = lambda x: np.ones_like(x)
+    mat_dict["D"].calc_dNdEs(I_E, rhoL_func)
+    mat_dict["He3"].calc_dNdEs(I_E, rhoL_func)
+    nD = frac_D * mat_dict["D"].elastic_dNdE
+    nHe3 = frac_He3 * mat_dict["He3"].elastic_dNdE
+    He3np = frac_He3 * mat_dict["He3"].np_dNdE
+    total = nD + nHe3 + He3np
+    return total, (nD, nHe3, He3np)
+
+
+def DHe3_asym_scatter_spec(
+    I_E: npt.NDArray, rhoL_func: callable, frac_D: float = frac_D_default, frac_He3: float = frac_He3_default
+) -> typing.Tuple[npt.NDArray, typing.Tuple[npt.NDArray, npt.NDArray, npt.NDArray, npt.NDArray]]:
+    """Calculates the single scattered neutron spectrum for DT given a
+    primary neutron spectrum of I_E from anisotropic areal density
+
+    This requires the scattering matrices to have been pre-calculated
+
+    The primary neutron spectrum, I_E, is assumed to be on the same energy grid as
+    the incoming energy grid used to calculate the scattering matrices
+
+    The areal density function rhoL_func needs to be a callable function with a
+    single argument (cosine[theta])
+
+    Args:
+        I_E (numpy.array): the neutron spectrum at Ein energies
+        rhoL_func (callable): must be a single argument function f(x),
+        where x e [-1,1] and f(x) e [0,inf] and int f(x) dx = 1
+        frac_D (float) : fraction of D in fuel
+        frac_He3 (float) : fraction of He3 in fuel
+
+    Returns:
+        Tuple of numpy.arrays: the total scattered spectrum and a tuple of the components
+        (nD,nHe3,Dn2n,He3np)
+
+    """
+    mat_dict["D"].calc_dNdEs(I_E, rhoL_func)
+    mat_dict["He3"].calc_dNdEs(I_E, rhoL_func)
+    nD = frac_D * mat_dict["D"].elastic_dNdE
+    nHe3 = frac_He3 * mat_dict["He3"].elastic_dNdE
+    He3np = frac_He3 * mat_dict["He3"].np_dNdE
+    total = nD + nHe3 + Dn2n + He3np
+    return total, (nD, nHe3, He3np)
+
+
+def DHe3_scatter_spec_w_ionkin(
+    I_E: npt.NDArray,
+    vbar: float,
+    dv: float,
+    rhoL_func: callable,
+    frac_D: float = frac_D_default,
+    frac_He3: float = frac_He3_default,
+) -> typing.Tuple[npt.NDArray, typing.Tuple[npt.NDArray, npt.NDArray, npt.NDArray, npt.NDArray]]:
+    """Calculates the single scattered neutron spectrum for DHe3 given a
+    primary neutron spectrum of I_E from anisotropic areal density and including
+    ion velocities kinematics
+
+    This requires the scattering matrices with ion kinematics to have been pre-calculated
+
+    The primary neutron spectrum, I_E, is assumed to be on the same energy grid as
+    the incoming energy grid used to calculate the scattering matrices
+
+    The areal density function rhoL_func needs to be a callable function with a
+    single argument (cosine[theta])
+
+    Args:
+        I_E (numpy.array): the neutron spectrum at Ein energies
+        vbar (float) : mean velocity of the scattering ions
+        dv (float) : standard deviation velocity of the scattering ions
+        rhoL_func (callable): must be a single argument function f(x),
+        where x e [-1,1] and f(x) e [0,inf] and int f(x) dx = 1
+        frac_D (float) : fraction of D in fuel
+        frac_He3 (float) : fraction of He3 in fuel
+
+    Returns:
+        Tuple of numpy.arrays: the total scattered spectrum and a tuple of the components
+        (nD,nHe3,Dn2n,He3np)
+
+    """
+    rhoL_func = lambda x: np.ones_like(x)
+    mat_dict["D"].calc_dNdEs(I_E, rhoL_func)
+    mat_dict["He3"].calc_dNdEs(I_E, rhoL_func)
+    if mat_dict["D"].vvec is None:
+        dNdE_nD = mat_dict["D"].elastic_dNdE
+    else:
+        dNdE_nD = mat_dict["D"].matrix_interpolate_gaussian(mat_dict["D"].Eout, vbar, dv)
+    if mat_dict["He3"].vvec is None:
+        dNdE_nHe3 = mat_dict["He3"].elastic_dNdE
+    else:
+        dNdE_nHe3 = mat_dict["He3"].matrix_interpolate_gaussian(mat_dict["He3"].Eout, vbar, dv)
+    nD = frac_D * dNdE_nD
+    nHe3 = frac_He3 * dNdE_nHe3
+    He3np = frac_He3 * mat_dict["He3"].np_dNdE
+    total = nD + nHe3 + He3np
+    return total, (nD, nHe3, He3np)
+
+
+def DHe3_transmission(
+    rhoL: float, E_in: npt.NDArray, rhoL_func: callable, frac_D: float = frac_D_default, frac_He3: float = frac_He3_default
+) -> npt.NDArray:
+    """
+    Calculates the straight line transmission of primary fusion sources through the DHe3 areal density
+
+    The areal density function rhoL_func needs to be a callable function with a
+    single argument (cosine[theta])
+
+    Args:
+        rhoL (float): the (4-pi averaged) areal density of the DHe3
+        E_in (numpy.array): the energy array of the primary neutron spectrum
+        rhoL_func (callable): must be a single argument function f(x),
+        where x e [-1,1] and f(x) e [0,inf] and int f(x) dx = 1
+        frac_D (float) : fraction of D in fuel
+        frac_He3 (float) : fraction of He3 in fuel
+
+    Returns:
+        numpy.array: the total transmission coefficient as calculated
+
+        exp[ - A_1S rhoL_func(1) (f_D sigma_{D,tot}(Ein) + f_He3 sigma_{He3,tot}(Ein)) ]
+
+    """
+    A_1S = DHe3rhoR_2_A1s(rhoL, frac_D=frac_D, frac_He3=frac_He3)
+    tot_xsec = frac_D * mat_dict["D"].sigma_tot(E_in) + frac_He3 * mat_dict["He3"].sigma_tot(E_in)
+    return np.exp(-A_1S * rhoL_func(1.0) * tot_xsec)
+
 def mat_scatter_spec(mat: typing.Type[sm.material_data], I_E: npt.NDArray, rhoL_func: callable) -> npt.NDArray:
     """Calculates a material's single scattered neutron spectrum given a
     primary neutron spectrum of I_E from anisotropic areal density
@@ -577,7 +781,7 @@ def mat_transmission(
 
     Args:
         mat (material_data) : Material data class for attenuating medium
-        rhoL (float): the (4-pi averaged) areal density of the DT
+        rhoL (float): the (4-pi averaged) areal density of the fuel
         E_in (numpy.array): the energy array of the primary neutron spectrum
         rhoL_func (callable): must be a single argument function f(x),
         where x e [-1,1] and f(x) e [0,inf] and int f(x) dx = 1
@@ -650,5 +854,60 @@ def A1s_2_rhoR(
         float : the DT areal density in kg/m^2
     """
     mbar = (frac_D * sm.A_D + frac_T * sm.A_T) * Mn_kg
+    rhoR = A_1S / (sigmabarn / mbar)
+    return rhoR
+
+def calc_DHe3_sigmabar(
+    Ein: npt.NDArray, I_E: npt.NDArray, frac_D: float = frac_D_default, frac_He3: float = frac_He3_default
+) -> float:
+    """Calculates the spectral-averaged cross section for DHe3
+
+    Args:
+        Ein (numpy.array): the array on incoming neutron energies
+        I_E (numpy.array): the neutron spectrum at Ein energies, assumed normalised
+        frac_D (float) : fraction of D in fuel
+        frac_He3 (float) : fraction of He3 in fuel
+
+    Returns:
+        float : the spectrally averaged total DT cross section
+    """
+    sigmabar = frac_D * np.trapezoid(mat_dict["D"].sigma_tot(Ein) * I_E, Ein) + frac_He3 * np.trapezoid(
+        mat_dict["He3"].sigma_tot(Ein) * I_E, Ein
+    )
+    return sigmabar
+
+
+def DHe3rhoR_2_A1s(
+    rhoR: float | npt.NDArray, frac_D: float = frac_D_default, frac_He3: float = frac_He3_default
+) -> float | npt.NDArray:
+    """Calculates the scattering amplitude given a DHe3 areal density in kg/m^2
+
+    Args:
+        rhoR (float): the DHe3 areal density in kg/m^2
+        frac_D (float) : fraction of D in fuel
+        frac_He3 (float) : fraction of He3 in fuel
+
+    Returns:
+        float : the scattering amplitude for single scattering
+    """
+    mbar = (frac_D * sm.A_D + frac_He3 * sm.A_He3) * Mn_kg
+    A_1S = rhoR * (sigmabarn / mbar)
+    return A_1S
+
+
+def DHe3A1s_2_rhoR(
+    A_1S: float | npt.NDArray, frac_D: float = frac_D_default, frac_He3: float = frac_He3_default
+) -> float | npt.NDArray:
+    """Calculates the DHe3 areal density in kg/m^2 given a scattering amplitude
+
+    Args:
+        A_1S (float): the scattering amplitude for single scattering
+        frac_D (float) : fraction of D in fuel
+        frac_He3 (float) : fraction of He3 in fuel
+
+    Returns:
+        float : the DHe3 areal density in kg/m^2
+    """
+    mbar = (frac_D * sm.A_D + frac_He3 * sm.A_He3) * Mn_kg
     rhoR = A_1S / (sigmabarn / mbar)
     return rhoR
